@@ -46,8 +46,8 @@ cd NetSentry
   ```
   Añade lo siguiente y guarda:
   ```bash
-  TELEGRAM_BOT_TOKEN=tu_token_aqui
-  TELEGRAM_CHAT_ID=tu_chat_id_aqui
+  TELEGRAM_BOT_TOKEN="tu_token_aqui"
+  TELEGRAM_CHAT_ID="tu_chat_id_aqui"
   REBOOT_PIN=tu_PIN_aqui
   ```
  
