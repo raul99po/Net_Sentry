@@ -1,0 +1,5 @@
+scapy
+requests
+python-dotenv
+psutil
+mac-vendor-lookup
