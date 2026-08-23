@@ -29,7 +29,7 @@ Este script de Python proporciona una capa de seguridad y control total para tu 
 1. **Clona el repositorio**:
  ```bash
   git clone https://github.com/raul99po/Net_Sentry.git
-cd NetSentry
+cd Net_Sentry
  ```
 
 2. **Instala las dependencias necesarias:**:
