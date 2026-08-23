@@ -9,6 +9,11 @@ import sqlite3
 import concurrent.futures
 import subprocess
 import psutil
+import hmac
+import signal
+import sys
+import logging
+import logging.handlers
 from datetime import datetime, timedelta
 import requests
 from scapy.all import ARP, Ether, srp, conf
@@ -21,12 +26,16 @@ from dotenv import load_dotenv
 # Cargar variables de entorno (busca el archivo .env)
 load_dotenv('/etc/sentry-telegram.env')
 
+NETSENTRY_VERSION = "1.2.0"
+START_TIME = datetime.now()
+
 INTERVAL_SECONDS = 600              # Frecuencia del escaneo periódico (10 min)
 OFFLINE_THRESHOLD_CYCLES = 2        # Ciclos sin responder antes de marcar Offline
 DB_FILE = "netsentry.db"            # Base de datos SQLite
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+REBOOT_PIN = os.getenv("REBOOT_PIN")  # PIN obligatorio para /reboot_host
 
 COMMON_PORTS = [22, 53, 80, 443, 445, 3389, 8080, 8443]
 
@@ -43,13 +52,38 @@ OUI_META_FILE = "oui_last_update.json"
 OUI_UPDATE_INTERVAL_DAYS = 7
 OUI_UPDATE_TIMEOUT_SECONDS = 60
 
+# --- Persistencia del modo silencio ---
+SILENCE_STATE_FILE = "silence_state.json"
+
+# --- Logging ---
+LOG_FILE = "netsentry.log"
+
 mac_lookup = MacLookup()
 
 # Variables globales de control y concurrencia
 db_lock = threading.Lock()
 scan_trigger_event = threading.Event()
+shutdown_event = threading.Event()
 gateway_info = {"ip": None, "mac": None}
 silence_until = None  # Control del modo No Molestar
+
+# ==========================================
+# 1.1 CONFIGURACIÓN DE LOGGING
+# ==========================================
+logger = logging.getLogger("netsentry")
+logger.setLevel(logging.INFO)
+
+_log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+_file_handler = logging.handlers.RotatingFileHandler(
+    LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+_file_handler.setFormatter(_log_formatter)
+logger.addHandler(_file_handler)
+
+_console_handler = logging.StreamHandler(sys.stdout)
+_console_handler.setFormatter(_log_formatter)
+logger.addHandler(_console_handler)
 
 # ==========================================
 # 2. DETECCIÓN DE RED Y GATEWAY
@@ -65,23 +99,82 @@ def get_auto_subnet_and_gw() -> tuple:
             if addr == local_ip and (gw in ("0.0.0.0", "0", "") or gw is None):
                 mask_str = socket.inet_ntoa(mask.to_bytes(4, "big")) if isinstance(mask, int) else str(mask)
                 interface = ipaddress.IPv4Interface(f"{local_ip}/{mask_str}")
-                
+
                 # PARCHE: Si detecta /32 (ej. Hostspot iPhone), forzamos /24
                 if interface.network.prefixlen == 32:
                     detected_subnet = str(ipaddress.IPv4Network(f"{local_ip}/24", strict=False))
                 else:
                     detected_subnet = str(interface.network)
                 break
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Detección de subred vía Scapy falló ({e}), probando método de respaldo...")
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                 s.connect(("8.8.8.8", 80))
                 local_ip = s.getsockname()[0]
             detected_subnet = str(ipaddress.IPv4Network(f"{local_ip}/24", strict=False))
-        except Exception:
-            pass
+        except Exception as e2:
+            logger.error(f"Método de respaldo también falló ({e2}). Se usará la subred por defecto: {detected_subnet}")
 
     return detected_subnet, gw_ip
+
+def resolve_gateway_mac(gw_ip: str) -> str:
+    if not gw_ip:
+        return None
+
+    mac_arp_direct = None
+    mac_kernel_cache = None
+
+    # Método 1: ARP request activo dirigido al gateway
+    try:
+        arp_request = ARP(pdst=gw_ip)
+        broadcast_frame = Ether(dst="ff:ff:ff:ff:ff:ff")
+        packet = broadcast_frame / arp_request
+        answered, _ = srp(packet, timeout=3, retry=2, verbose=False)
+        for _, received in answered:
+            if received.psrc == gw_ip:
+                mac_arp_direct = received.hwsrc.lower()
+                break
+    except Exception as e:
+        logger.error(f"Error resolviendo MAC del gateway vía ARP directo: {e}")
+
+    # Método 2: caché ARP del kernel
+    try:
+        with open("/proc/net/arp", "r") as f:
+            lines = f.readlines()[1:]
+        for line in lines:
+            fields = line.split()
+            if len(fields) >= 4 and fields[0] == gw_ip:
+                candidate = fields[3].lower()
+                if candidate != "00:00:00:00:00:00":
+                    mac_kernel_cache = candidate
+                break
+    except Exception as e:
+        logger.error(f"Error leyendo caché ARP del kernel: {e}")
+
+    if mac_arp_direct and mac_kernel_cache:
+        if mac_arp_direct == mac_kernel_cache:
+            logger.info(f"MAC del gateway confirmada por dos métodos independientes: {mac_arp_direct}")
+            return mac_arp_direct
+        else:
+            alerta = (
+                "🚨🚨 <b>ALERTA AL ARRANCAR: DISCREPANCIA EN LA MAC DEL GATEWAY</b> 🚨🚨\n\n"
+                "El ARP directo y la caché del kernel dan MACs distintas para el gateway. "
+                "Esto puede indicar que ya hay un ataque MITM/ARP Spoofing en curso.\n\n"
+                f"• <b>ARP directo:</b> <code>{esc(mac_arp_direct)}</code>\n"
+                f"• <b>Caché kernel:</b> <code>{esc(mac_kernel_cache)}</code>\n\n"
+                "⚠️ No se fijará ninguna MAC como legítima automáticamente. Revisa la red manualmente."
+            )
+            logger.warning(f"Discrepancia en la MAC del gateway al arrancar: ARP directo={mac_arp_direct} / caché kernel={mac_kernel_cache}")
+            send_telegram_msg(alerta)
+            return None
+
+    resolved = mac_arp_direct or mac_kernel_cache
+    if resolved:
+        logger.warning(f"MAC del gateway resuelta por una sola fuente (sin verificación cruzada): {resolved}")
+    else:
+        logger.warning("No se pudo resolver la MAC del gateway al arrancar. La detección de MITM quedará desactivada hasta el primer barrido.")
+    return resolved
 
 # ==========================================
 # 3. UTILIDADES DE ANÁLISIS DE HOSTS Y WOL
@@ -91,6 +184,12 @@ def is_locally_administered_mac(mac: str) -> bool:
         first_byte = int(mac.split(":")[0], 16)
         return bool(first_byte & 0x02)
     except Exception:
+        return False
+
+def is_ip_in_subnet(ip: str, subnet: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip) in ipaddress.ip_network(subnet, strict=False)
+    except ValueError:
         return False
 
 def quick_port_scan(ip: str, ports: list = COMMON_PORTS) -> list:
@@ -119,7 +218,7 @@ def send_wol_packet(mac_address: str, broadcast_ip: str = "255.255.255.255", por
             s.sendto(magic_packet, (broadcast_ip, port))
         return True
     except Exception as e:
-        print(f"[!] Error enviando WoL: {e}")
+        logger.error(f"Error enviando WoL: {e}")
         return False
 
 def get_hostname(ip: str) -> str:
@@ -146,6 +245,21 @@ def esc(value) -> str:
         return ""
     return html.escape(str(value), quote=False)
 
+def format_uptime(delta: timedelta) -> str:
+    total_seconds = int(delta.total_seconds())
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    if minutes or hours or days:
+        parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+    return " ".join(parts)
+
 # ==========================================
 # 3.1 ACTUALIZACIÓN DE BASE OUI (IEEE)
 # ==========================================
@@ -165,7 +279,7 @@ def mark_oui_updated():
         with open(OUI_META_FILE, "w", encoding="utf-8") as f:
             json.dump({"last_update": datetime.now().isoformat()}, f)
     except Exception as e:
-        print(f"[!] No se pudo guardar la marca de actualización OUI: {e}")
+        logger.error(f"No se pudo guardar la marca de actualización OUI: {e}")
 
 def safe_update_vendors(timeout: int = OUI_UPDATE_TIMEOUT_SECONDS) -> bool:
     def _do_update():
@@ -175,30 +289,56 @@ def safe_update_vendors(timeout: int = OUI_UPDATE_TIMEOUT_SECONDS) -> bool:
             future = executor.submit(_do_update)
             future.result(timeout=timeout)
         mark_oui_updated()
-        print("[*] Base OUI actualizada correctamente.")
+        logger.info("Base OUI actualizada correctamente.")
         return True
     except concurrent.futures.TimeoutError:
-        print(f"[!] Actualización OUI cancelada: superó {timeout}s. Se usará la caché local.")
+        logger.warning(f"Actualización OUI cancelada: superó {timeout}s. Se usará la caché local.")
         return False
     except Exception as e:
-        print(f"[!] Error actualizando base OUI: {e}. Se usará la caché local.")
+        logger.error(f"Error actualizando base OUI: {e}. Se usará la caché local.")
         return False
+
+# ==========================================
+# 3.2 PERSISTENCIA DEL MODO SILENCIO
+# ==========================================
+def save_silence_state():
+    try:
+        with open(SILENCE_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"silence_until": silence_until.isoformat() if silence_until else None}, f)
+    except Exception as e:
+        logger.error(f"No se pudo guardar el estado de silencio: {e}")
+
+def load_silence_state():
+    global silence_until
+    if not os.path.exists(SILENCE_STATE_FILE):
+        return
+    try:
+        with open(SILENCE_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        val = data.get("silence_until")
+        if val:
+            restored = datetime.fromisoformat(val)
+            if restored > datetime.now():
+                silence_until = restored
+                logger.info(f"Modo silencio restaurado tras reinicio, activo hasta las {restored.strftime('%Y-%m-%d %H:%M')}.")
+            else:
+                silence_until = None
+                save_silence_state()
+    except Exception as e:
+        logger.error(f"No se pudo cargar el estado de silencio: {e}")
 
 # ==========================================
 # 4. PERSISTENCIA (SQLITE) Y ALERTAS TELEGRAM
 # ==========================================
 def send_telegram_msg(text: str):
-    """Envío genérico de texto en HTML a Telegram."""
     global silence_until
-    
-    # Comprobar si estamos en modo "No Molestar"
+
     if silence_until and datetime.now() < silence_until:
-        # Solo silenciamos los avisos automáticos, permitimos respuestas a comandos interactivos si empiezan por ciertos emojis
-        if not text.startswith(("✅", "❌", "📊", "📡", "🗑️", "🔇", "🔄", "ℹ️", "🟢", "🛠️", "⚠️", "⚡")):
+        if not text.startswith(("✅", "❌", "📊", "📡", "🗑️", "🔇", "🔄", "ℹ️", "🟢", "🛠️", "⚠️", "⚡", "🛑", "⏱️", "🔍", "🔌", "🕵️‍♂️", "💻", "❓")):
             return
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[LOG LOCAL - FALTAN CREDENCIALES TELEGRAM]\n{text}\n")
+        logger.info(f"[LOG LOCAL - FALTAN CREDENCIALES TELEGRAM] {text}")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -210,10 +350,9 @@ def send_telegram_msg(text: str):
     try:
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
-        print(f"[!] Error enviando a Telegram: {e}")
+        logger.error(f"Error enviando a Telegram: {e}")
 
 def init_db():
-    """Inicializa la base de datos SQLite y crea la tabla si no existe."""
     with db_lock:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
@@ -234,33 +373,31 @@ def init_db():
         conn.close()
 
 def load_known_devices() -> dict:
-    """Carga los dispositivos desde SQLite a un diccionario en memoria."""
     devices = {}
     if not os.path.exists(DB_FILE):
         return devices
 
     try:
         conn = sqlite3.connect(DB_FILE)
-        conn.row_factory = sqlite3.Row  # Permite acceder por nombre de columna
+        conn.row_factory = sqlite3.Row 
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM devices")
-        
+
         for row in cursor.fetchall():
             devices[row["mac"]] = dict(row)
         conn.close()
     except Exception as e:
-        print(f"[!] Error leyendo base de datos SQLite: {e}")
+        logger.error(f"Error leyendo base de datos SQLite: {e}")
     return devices
 
 def save_known_devices(devices: dict):
-    """Guarda/actualiza el diccionario de dispositivos en SQLite (UPSERT)."""
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        
+
         sql = '''
-            INSERT INTO devices 
-            (mac, ip, hostname, vendor, alias, status, missed_cycles, first_seen, last_seen) 
+            INSERT INTO devices
+            (mac, ip, hostname, vendor, alias, status, missed_cycles, first_seen, last_seen)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(mac) DO UPDATE SET
                 ip = excluded.ip,
@@ -271,7 +408,7 @@ def save_known_devices(devices: dict):
                 missed_cycles = excluded.missed_cycles,
                 last_seen = excluded.last_seen
         '''
-        
+
         for mac, data in devices.items():
             cursor.execute(sql, (
                 mac,
@@ -284,11 +421,11 @@ def save_known_devices(devices: dict):
                 data.get("first_seen"),
                 data.get("last_seen")
             ))
-            
+
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"[!] Error guardando en base de datos SQLite: {e}")
+        logger.error(f"Error guardando en base de datos SQLite: {e}")
 
 # ==========================================
 # 5. MOTOR DE ESCANEO ARP
@@ -336,6 +473,14 @@ def perform_audit_cycle(subnet: str):
         if gateway_info["ip"] and ip == gateway_info["ip"]:
             if gateway_info["mac"] is None:
                 gateway_info["mac"] = mac
+                messages_to_send.append(
+                    "⚠️ <b>MAC del gateway fijada durante el barrido (sin verificación cruzada inicial)</b>\n\n"
+                    f"🌐 <b>IP:</b> <code>{esc(ip)}</code>\n"
+                    f"🏷️ <b>MAC registrada como legítima:</b> <code>{esc(mac)}</code>\n"
+                    "Esto ocurre porque no se pudo confirmar la MAC del gateway al arrancar el servicio. "
+                    "Verifícala manualmente si tienes dudas.\n"
+                    f"⏰ <b>Hora:</b> {timestamp}"
+                )
             elif gateway_info["mac"] != mac:
                 messages_to_send.append(
                     "🚨🚨 <b>ALERTA CRÍTICA: POSIBLE ARP SPOOFING / MITM</b> 🚨🚨\n\n"
@@ -442,13 +587,14 @@ def perform_audit_cycle(subnet: str):
         save_known_devices(devices)
 
 def background_monitor(subnet: str):
-    while True:
+    while not shutdown_event.is_set():
         try:
             perform_audit_cycle(subnet)
         except Exception as e:
-            print(f"[!] Error en monitor de fondo: {e}")
+            logger.error(f"Error en monitor de fondo: {e}")
         scan_trigger_event.wait(timeout=INTERVAL_SECONDS)
         scan_trigger_event.clear()
+    logger.info("Monitor de fondo detenido correctamente (apagado ordenado).")
 
 # ==========================================
 # 7. BOT INTERACTIVO TELEGRAM (COMANDOS)
@@ -459,15 +605,22 @@ def telegram_listener(subnet: str):
 
     offset = None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    
+    session = requests.Session()
+    retry_delay = 3
 
-    while True:
+    while not shutdown_event.is_set():
         try:
             params = {"timeout": 20, "offset": offset}
-            res = requests.get(url, params=params, timeout=25)
+            res = session.get(url, params=params, timeout=25)
+            
             if res.status_code != 200:
-                time.sleep(3)
+                logger.warning(f"Error API Telegram: HTTP {res.status_code}")
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 60)  # Exponential backoff
                 continue
 
+            retry_delay = 3  # Reset del backoff en caso de éxito
             updates = res.json().get("result", [])
             for update in updates:
                 offset = update["update_id"] + 1
@@ -480,9 +633,78 @@ def telegram_listener(subnet: str):
 
                 handle_telegram_command(text, subnet)
 
-        except Exception:
-            time.sleep(3)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error de red comunicando con Telegram: {e}")
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)
+        except Exception as e:
+            logger.error(f"Error inesperado en listener de Telegram: {e}")
+            time.sleep(retry_delay)
+            
+    logger.info("Listener de Telegram detenido correctamente (apagado ordenado).")
 
+# --- FUNCIONES ASÍNCRONAS PARA COMANDOS PESADOS ---
+def async_execute_ping(target: str):
+    send_telegram_msg(f"📡 Haciendo ping a <code>{esc(target)}</code>...")
+    try:
+        res = subprocess.run(["ping", "-c", "4", target], capture_output=True, text=True, timeout=10)
+        if res.returncode == 0:
+            stats = res.stdout.strip().split('\n')[-1]
+            send_telegram_msg(f"✅ <b>Ping exitoso:</b>\n<code>{esc(stats)}</code>")
+        else:
+            send_telegram_msg(f"❌ <b>Error:</b> El host {esc(target)} no responde al ping.")
+    except FileNotFoundError:
+        send_telegram_msg("❌ <b>Error:</b> El comando 'ping' no se encuentra instalado en el sistema operativo.")
+    except Exception as e:
+        send_telegram_msg(f"❌ Error al ejecutar el ping: {e}")
+
+def async_execute_portscan(target_ip: str):
+    send_telegram_msg(f"🔍 <i>Escaneando los 100 puertos principales en <code>{esc(target_ip)}</code>...</i>")
+    try:
+        res = subprocess.run(
+            ["nmap", "-sS", "-sV", "--top-ports", "100", "-T4", target_ip],
+            capture_output=True, text=True, timeout=60
+        )
+        lines = res.stdout.split("\n")
+        open_services = [l for l in lines if "/tcp" in l and "open" in l]
+
+        if open_services:
+            result_text = "\n".join([f"• <code>{esc(s)}</code>" for s in open_services])
+            send_telegram_msg(f"🔌 <b>Puertos abiertos en {esc(target_ip)}:</b>\n\n{result_text}")
+        else:
+            send_telegram_msg(f"🔒 No se encontraron puertos abiertos comunes en <code>{esc(target_ip)}</code>.")
+    except FileNotFoundError:
+        send_telegram_msg("❌ <b>Error:</b> Nmap no está instalado. Ejecuta: <code>sudo apt install nmap</code> en tu servidor.")
+    except subprocess.TimeoutExpired:
+        send_telegram_msg("⏱️ El escaneo de puertos tardó demasiado tiempo (timeout 60s).")
+    except Exception as e:
+        send_telegram_msg(f"❌ Error ejecutando Nmap: {e}")
+
+def async_execute_osdetect(target_ip: str):
+    send_telegram_msg(f"🕵️‍♂️ <i>Analizando huella TCP/IP de <code>{esc(target_ip)}</code>... (puede tardar ~15s)</i>")
+    try:
+        res = subprocess.run(
+            ["nmap", "-O", "--osscan-guess", "-F", "-T4", target_ip],
+            capture_output=True, text=True, timeout=60
+        )
+        os_details = []
+        for line in res.stdout.split("\n"):
+            if "OS details:" in line or "Running:" in line or "Aggressive OS guesses:" in line:
+                os_details.append(line.strip())
+
+        if os_details:
+            formatted_os = "\n".join([f"• {esc(o)}" for o in os_details])
+            send_telegram_msg(f"💻 <b>Estimación de SO ({esc(target_ip)}):</b>\n\n{formatted_os}")
+        else:
+            send_telegram_msg(f"❓ No se pudo determinar el SO de <code>{esc(target_ip)}</code> (puede tener firewall activo o estar filtrando paquetes ICMP/TCP).")
+    except FileNotFoundError:
+        send_telegram_msg("❌ <b>Error:</b> Nmap no está instalado. Ejecuta: <code>sudo apt install nmap</code> en tu servidor.")
+    except subprocess.TimeoutExpired:
+        send_telegram_msg("⏱️ El análisis de SO superó el tiempo límite de 60s.")
+    except Exception as e:
+        send_telegram_msg(f"❌ Error en detección de SO: {e}")
+
+# --- MANEJADOR PRINCIPAL DE COMANDOS ---
 def handle_telegram_command(text: str, subnet: str):
     parts = text.split(maxsplit=2)
     cmd = parts[0].lower() if parts else ""
@@ -499,10 +721,12 @@ def handle_telegram_command(text: str, subnet: str):
             "• <code>/ping &lt;IP&gt;</code>: Prueba conexión ICMP.\n"
             "• <code>/forget &lt;MAC/Alias&gt;</code>: Borra dispositivo de la BD.\n"
             "• <code>/silence &lt;minutos&gt;</code>: Pausa notificaciones.\n"
-            "• <code>/reboot_host confirm</code>: Reinicia el servidor físico.\n"
+            "• <code>/silence off</code>: Cancela el silencio antes de tiempo.\n"
+            "• <code>/reboot_host confirm &lt;PIN&gt;</code>: Reinicia el servidor físico.\n"
             "• <code>/portscan &lt;IP/Alias&gt;</code>: Análisis de puertos del dispositivo.\n"
-            "• <code>/osdetect &lt;IP/Alias&gt;</code>: Detecta el sistema operativo."
-
+            "• <code>/osdetect &lt;IP/Alias&gt;</code>: Detecta el sistema operativo.\n"
+            "• <code>/version</code>: Muestra la versión de NetSentry.\n"
+            "• <code>/uptime</code>: Tiempo que lleva corriendo el servicio."
         )
         send_telegram_msg(help_msg)
 
@@ -616,14 +840,14 @@ def handle_telegram_command(text: str, subnet: str):
             ram = psutil.virtual_memory().percent
             disk = psutil.disk_usage('/').percent
             temp = "N/A"
-            
+
             if hasattr(psutil, "sensors_temperatures"):
                 temps = psutil.sensors_temperatures()
                 if "cpu_thermal" in temps:
                     temp = f"{temps['cpu_thermal'][0].current}°C"
                 elif "coretemp" in temps:
                     temp = f"{temps['coretemp'][0].current}°C"
-                    
+
             send_telegram_msg(
                 f"📊 <b>Estado del Servidor:</b>\n\n"
                 f"🌡️ <b>Temperatura:</b> {temp}\n"
@@ -638,17 +862,8 @@ def handle_telegram_command(text: str, subnet: str):
         if len(parts) < 2:
             send_telegram_msg("⚠️ <b>Uso:</b> <code>/ping &lt;IP&gt;</code>")
             return
-        target = parts[1]
-        send_telegram_msg(f"📡 Haciendo ping a <code>{esc(target)}</code>...")
-        try:
-            res = subprocess.run(["ping", "-c", "4", target], capture_output=True, text=True, timeout=10)
-            if res.returncode == 0:
-                stats = res.stdout.strip().split('\n')[-1]
-                send_telegram_msg(f"✅ <b>Ping exitoso:</b>\n<code>{esc(stats)}</code>")
-            else:
-                send_telegram_msg(f"❌ <b>Error:</b> El host {esc(target)} no responde al ping.")
-        except Exception:
-             send_telegram_msg("❌ Error al ejecutar el ping.")
+        # Lanzamos en un hilo separado para no bloquear el bot
+        threading.Thread(target=async_execute_ping, args=(parts[1],), daemon=True).start()
 
     elif cmd == "/forget":
         if len(parts) < 2:
@@ -656,14 +871,14 @@ def handle_telegram_command(text: str, subnet: str):
             return
         query = parts[1].lower()
         target_mac = None
-        
+
         with db_lock:
             devices = load_known_devices()
             for mac, d in list(devices.items()):
                 if mac == query or (d.get("alias") and d.get("alias").lower() == query):
                     target_mac = mac
                     break
-                    
+
             if target_mac:
                 conn = sqlite3.connect(DB_FILE)
                 conn.execute("DELETE FROM devices WHERE mac = ?", (target_mac,))
@@ -676,30 +891,51 @@ def handle_telegram_command(text: str, subnet: str):
     elif cmd == "/silence":
         global silence_until
         if len(parts) < 2:
-            send_telegram_msg("⚠️ <b>Uso:</b> <code>/silence &lt;minutos&gt;</code> (Ej: /silence 60)")
+            send_telegram_msg("⚠️ <b>Uso:</b> <code>/silence &lt;minutos&gt;</code> o <code>/silence off</code>")
             return
+
+        if parts[1].lower() == "off":
+            if silence_until:
+                silence_until = None
+                save_silence_state()
+                send_telegram_msg("🔔 <b>Modo Silencio desactivado.</b> Las alertas automáticas se han reanudado.")
+            else:
+                send_telegram_msg("ℹ️ El modo silencio ya estaba desactivado.")
+            return
+
         try:
             minutos = int(parts[1])
             silence_until = datetime.now() + timedelta(minutes=minutos)
-            send_telegram_msg(f"🔇 <b>Modo Silencio Activado</b>\nNo enviaré alertas automáticas durante {minutos} minutos (hasta las {silence_until.strftime('%H:%M')}).\nLos comandos manuales seguirán funcionando.")
+            save_silence_state()
+            send_telegram_msg(f"🔇 <b>Modo Silencio Activado</b>\nNo enviaré alertas automáticas durante {minutos} minutos (hasta las {silence_until.strftime('%H:%M')}).\nLos comandos manuales seguirán funcionando. Usa <code>/silence off</code> para cancelarlo antes.")
         except ValueError:
-            send_telegram_msg("❌ Debes indicar un número entero de minutos.")
+            send_telegram_msg("❌ Debes indicar un número entero de minutos, o <code>/silence off</code>.")
 
     elif cmd == "/reboot_host":
-        if len(parts) < 2 or parts[1] != "confirm":
-            send_telegram_msg("⚠️ <b>Peligro:</b> Para reiniciar el sistema operativo escribe: <code>/reboot_host confirm</code>")
+        if not REBOOT_PIN:
+            send_telegram_msg(
+                "🚫 <b>Comando deshabilitado.</b>\n"
+                "No hay <code>REBOOT_PIN</code> configurado en el <code>.env</code>. "
+                "Añádelo para poder usar este comando."
+            )
             return
-            
+
+        pin_parts = text.split()
+        if len(pin_parts) < 3 or pin_parts[1] != "confirm" or not hmac.compare_digest(pin_parts[2], REBOOT_PIN):
+            send_telegram_msg(
+                "⚠️ <b>Peligro:</b> Para reiniciar el sistema físico escribe:\n"
+                "<code>/reboot_host confirm &lt;PIN&gt;</code>"
+            )
+            return
+
+        logger.warning("Reinicio físico del servidor solicitado y confirmado vía Telegram.")
         send_telegram_msg("🔄 Reiniciando el servidor en 5 segundos. El bot se desconectará temporalmente...")
-        
-        # Creamos una función que espere 5 segundos antes de apagar
+
         def delayed_reboot():
             time.sleep(5)
             subprocess.Popen(["sudo", "reboot"])
-            
-        # Lo lanzamos en un hilo paralelo. 
-        # Así el script principal sigue corriendo, confirma la lectura a Telegram, y luego el PC se reinicia.
-        threading.Thread(target=delayed_reboot).start()
+
+        threading.Thread(target=delayed_reboot, daemon=True).start()
 
     elif cmd == "/portscan":
         if len(parts) < 2:
@@ -711,35 +947,22 @@ def handle_telegram_command(text: str, subnet: str):
 
         with db_lock:
             devices = load_known_devices()
-            # Si introdujo un Alias o una MAC, resolvemos la IP
             for mac, d in devices.items():
                 if query.lower() in (mac.lower(), (d.get("alias") or "").lower(), (d.get("hostname") or "").lower()):
                     target_ip = d.get("ip")
                     break
             if not target_ip:
-                target_ip = query  # Asumimos que pasó la IP directamente
+                target_ip = query 
 
-        send_telegram_msg(f"🔍 <i>Escaneando los 100 puertos principales en <code>{esc(target_ip)}</code>...</i>")
-        try:
-            # -sS: SYN Stealth Scan, --top-ports 100: los 100 puertos más comunes, -T4: rápido
-            res = subprocess.run(
-                ["nmap", "-sS", "-sV", "--top-ports", "100", "-T4", target_ip],
-                capture_output=True, text=True, timeout=60
+        if not is_ip_in_subnet(target_ip, subnet):
+            send_telegram_msg(
+                f"🚫 <b>Objetivo no permitido.</b>\n"
+                f"Solo se pueden escanear IPs dentro de la subred monitorizada (<code>{esc(subnet)}</code>)."
             )
+            return
             
-            lines = res.stdout.split("\n")
-            # Filtramos solo las líneas que contienen puertos abiertos
-            open_services = [l for l in lines if "/tcp" in l and "open" in l]
-
-            if open_services:
-                result_text = "\n".join([f"• <code>{esc(s)}</code>" for s in open_services])
-                send_telegram_msg(f"🔌 <b>Puertos abiertos en {esc(target_ip)}:</b>\n\n{result_text}")
-            else:
-                send_telegram_msg(f"🔒 No se encontraron puertos abiertos comunes en <code>{esc(target_ip)}</code>.")
-        except subprocess.TimeoutExpired:
-            send_telegram_msg("⏱️ El escaneo tardó demasiado tiempo (timeout 60s).")
-        except Exception as e:
-            send_telegram_msg(f"❌ Error ejecutando Nmap: {e}")
+        # Lanzamos en un hilo separado
+        threading.Thread(target=async_execute_portscan, args=(target_ip,), daemon=True).start()
 
     elif cmd == "/osdetect":
         if len(parts) < 2:
@@ -758,60 +981,92 @@ def handle_telegram_command(text: str, subnet: str):
             if not target_ip:
                 target_ip = query
 
-        send_telegram_msg(f"🕵️‍♂️ <i>Analizando huella TCP/IP de <code>{esc(target_ip)}</code>... (puede tardar ~15s)</i>")
-        try:
-            # -O: Detección de OS, --osscan-guess: estimación agresiva si hay dudas
-            res = subprocess.run(
-                ["nmap", "-O", "--osscan-guess", "-F", "-T4", target_ip],
-                capture_output=True, text=True, timeout=60
+        if not is_ip_in_subnet(target_ip, subnet):
+            send_telegram_msg(
+                f"🚫 <b>Objetivo no permitido.</b>\n"
+                f"Solo se pueden analizar IPs dentro de la subred monitorizada (<code>{esc(subnet)}</code>)."
             )
+            return
 
-            os_details = []
-            for line in res.stdout.split("\n"):
-                if "OS details:" in line or "Running:" in line or "Aggressive OS guesses:" in line:
-                    os_details.append(line.strip())
+        # Lanzamos en un hilo separado
+        threading.Thread(target=async_execute_osdetect, args=(target_ip,), daemon=True).start()
 
-            if os_details:
-                formatted_os = "\n".join([f"• {esc(o)}" for o in os_details])
-                send_telegram_msg(f"💻 <b>Estimación de SO ({esc(target_ip)}):</b>\n\n{formatted_os}")
-            else:
-                send_telegram_msg(f"❓ No se pudo determinar el SO de <code>{esc(target_ip)}</code> (puede tener firewall activo o estar filtrando paquetes ICMP/TCP).")
-        except subprocess.TimeoutExpired:
-            send_telegram_msg("⏱️ El análisis superó el tiempo límite.")
-        except Exception as e:
-            send_telegram_msg(f"❌ Error en detección de SO: {e}")
+    elif cmd == "/version":
+        send_telegram_msg(f"ℹ️ <b>NetSentry</b> v{NETSENTRY_VERSION}")
+
+    elif cmd == "/uptime":
+        delta = datetime.now() - START_TIME
+        send_telegram_msg(
+            f"⏱️ <b>Uptime:</b> {format_uptime(delta)}\n"
+            f"🚀 <b>En marcha desde:</b> {START_TIME.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+# ==========================================
+# 7.1 APAGADO ORDENADO (SIGTERM / SIGINT)
+# ==========================================
+def handle_shutdown_signal(signum, frame):
+    sig_name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
+    logger.info(f"Señal de apagado recibida ({sig_name}). Iniciando cierre ordenado de NetSentry...")
+    send_telegram_msg("🛑 <b>NetSentry deteniéndose</b> (señal de sistema recibida). El servicio se está cerrando de forma ordenada.")
+    shutdown_event.set()
+    scan_trigger_event.set() 
 
 # ==========================================
 # 8. ARRANQUE
 # ==========================================
 def main():
     global gateway_info
-    
+
+    signal.signal(signal.SIGTERM, handle_shutdown_signal)
+    signal.signal(signal.SIGINT, handle_shutdown_signal)
+
     init_db()
+    load_silence_state()
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[!] ADVERTENCIA: Faltan credenciales de Telegram en el entorno. Las notificaciones se mostrarán solo en consola.")
+        logger.warning("Faltan credenciales de Telegram en el entorno. Las notificaciones se mostrarán solo en consola/log.")
 
     subnet, gw_ip = get_auto_subnet_and_gw()
     gateway_info["ip"] = gw_ip
 
-    print("=" * 50)
-    print("🛡️  NETSENTRY MONITOR & AUDIT (SQLite) 🛡️")
-    print(f"[*] Subred objetivo: {subnet}")
-    print(f"[*] Gateway detectado: {gw_ip}")
-    print(f"[*] Frecuencia automática: {INTERVAL_SECONDS}s")
-    print("=" * 50)
+    logger.info("=" * 50)
+    logger.info(f"🛡️  NETSENTRY MONITOR & AUDIT v{NETSENTRY_VERSION} (SQLite) 🛡️")
+    logger.info(f"Subred objetivo: {subnet}")
+    logger.info(f"Gateway detectado: {gw_ip}")
+    logger.info(f"Frecuencia automática: {INTERVAL_SECONDS}s")
+    logger.info("=" * 50)
+
+    if not gw_ip:
+        logger.warning("No se pudo detectar el gateway automáticamente. La protección anti-MITM está DESACTIVADA.")
+        send_telegram_msg(
+            "⚠️ <b>Aviso al arrancar NetSentry</b>\n\n"
+            "No se pudo detectar automáticamente el gateway de la red. "
+            "La protección anti-ARP-Spoofing / MITM quedará <b>desactivada</b> hasta que se detecte manualmente.\n"
+            f"Subred usada: <code>{esc(subnet)}</code>"
+        )
+    else:
+        gateway_info["mac"] = resolve_gateway_mac(gw_ip)
+        if gateway_info["mac"]:
+            logger.info(f"MAC del gateway fijada de forma segura: {gateway_info['mac']}")
+        else:
+            logger.warning("La MAC del gateway no se pudo confirmar de forma segura al arrancar. Se fijará en el primer barrido (con aviso).")
+
+    if not REBOOT_PIN:
+        logger.warning("REBOOT_PIN no está configurado en el .env. El comando /reboot_host quedará deshabilitado.")
 
     if should_update_oui():
-        print(f"[*] Han pasado {OUI_UPDATE_INTERVAL_DAYS}+ días, actualizando base OUI en segundo plano...")
+        logger.info(f"Han pasado {OUI_UPDATE_INTERVAL_DAYS}+ días, actualizando base OUI en segundo plano...")
         threading.Thread(target=safe_update_vendors, daemon=True).start()
     else:
-        print("[*] Base OUI actualizada recientemente, se omite descarga.")
+        logger.info("Base OUI actualizada recientemente, se omite descarga.")
 
     bot_thread = threading.Thread(target=telegram_listener, args=(subnet,), daemon=True)
     bot_thread.start()
 
-    background_monitor(subnet)
+    try:
+        background_monitor(subnet)
+    finally:
+        logger.info("NetSentry finalizado.")
 
 if __name__ == "__main__":
     main()
