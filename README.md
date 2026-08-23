@@ -59,6 +59,10 @@ sudo chmod +x netsentry.py
 sudo python3 netsentry.py
 ```
 (Si todo funciona correctamente, verás la inicialización en consola. Presiona Ctrl+C para detenerlo y pasa al siguiente paso para dejarlo fijo en segundo plano).
+Mover el archivo a la carpeta /opt:
+```bash
+mv Net_Sentry /opt/netsentry
+```
 
 5. **Ejecución como servicio systemd (Recomendado):**:
 Para asegurar que la monitorización sea constante (24x7) y arranque automáticamente, crearemos un servicio. Al poner User=root en la configuración, systemd ya se encargará de darle los permisos necesarios.
@@ -75,8 +79,8 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/ruta/absoluta/a/tu/NetSentry
-ExecStart=/usr/bin/python3 /ruta/absoluta/a/tu/NetSentry/netsentry.py
+WorkingDirectory=/opt/netsentry
+ExecStart=/usr/bin/python3 /opt/netsentry/netsentry.py
 Restart=on-failure
 RestartSec=10
 
