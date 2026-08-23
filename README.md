@@ -27,15 +27,17 @@ Este script de Python proporciona una capa de seguridad y control total para tu 
 ## 🚀 Instalación
 
 1. **Clona el repositorio**:
-   ```bash
-   git clone https://github.com/raul99po/Net_Sentry.git
-   cd NetSentry
+ ```bash
+  git clone https://github.com/raul99po/Net_Sentry.git
+cd NetSentry
+ ```
 
 2. **Instala las dependencias necesarias:**:
-   El proyecto utiliza un archivo requirements.txt para gestionar las librerías de Python.
-   ```bash
-   sudo apt update && sudo apt install nmap -y
-   pip3 install -r requirements.txt
+  El proyecto utiliza un archivo requirements.txt para gestionar las librerías de Python.
+  ```bash
+  sudo apt update && sudo apt install nmap -y
+  pip3 install -r requirements.txt
+  ```
 
 3. **Edita tus credenciales (BOT_TOKEN y CHAT_ID):**:
   Crea el archivo .env en la ruta segura configurada en el script:
