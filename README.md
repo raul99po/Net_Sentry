@@ -5,7 +5,7 @@ Este script de Python proporciona una capa de seguridad y control total para tu 
 ![GitHub](https://img.shields.io/badge/Version-1.0-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-## ✨ Características Principales-
+## ✨ Características Principales
 - 🔍 **Monitorización Proactiva:** Realiza barridos ARP silenciosos para detectar cualquier host nuevo, cambios de IP o dispositivos que se desconectan.
 - 🧠 **Persistencia Inteligente:** Utiliza una base de datos SQLite local para recordar dispositivos conocidos, asignarles alias y registrar su historial.
 - 🚨 **Anti-Spoofing:** Alerta de forma crítica si detecta que la dirección MAC de la puerta de enlace (Gateway) cambia, previniendo ataques Man-In-The-Middle.
